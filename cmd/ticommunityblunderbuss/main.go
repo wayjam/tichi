@@ -2,86 +2,37 @@ package main
 
 import (
 	"crypto/tls"
-	"encoding/json"
-	"flag"
-	"fmt"
 	"net/http"
-	"os"
-	"strconv"
-	"time"
 
 	"github.com/sirupsen/logrus"
+	"k8s.io/test-infra/prow/config/secret"
+	"k8s.io/test-infra/prow/github"
+
 	tiexternalplugins "github.com/ti-community-infra/tichi/internal/pkg/externalplugins"
 	"github.com/ti-community-infra/tichi/internal/pkg/externalplugins/blunderbuss"
-
 	"github.com/ti-community-infra/tichi/internal/pkg/ownersclient"
-	"k8s.io/test-infra/pkg/flagutil"
-	"k8s.io/test-infra/prow/config/secret"
-	prowflagutil "k8s.io/test-infra/prow/flagutil"
-	"k8s.io/test-infra/prow/github"
-	"k8s.io/test-infra/prow/interrupts"
-	"k8s.io/test-infra/prow/pjutil"
-	"k8s.io/test-infra/prow/pluginhelp/externalplugins"
 )
 
-type options struct {
-	port int
+type svr struct {
+	tiexternalplugins.BaseServer
 
-	dryRun bool
-	github prowflagutil.GitHubOptions
-
-	externalPluginsConfig string
-
-	webhookSecretFile string
-}
-
-// validate validates github options.
-func (o *options) validate() error {
-	for idx, group := range []flagutil.OptionGroup{&o.github} {
-		if err := group.Validate(o.dryRun); err != nil {
-			return fmt.Errorf("%d: %w", idx, err)
-		}
-	}
-
-	return nil
-}
-
-func gatherOptions() options {
-	o := options{}
-	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	fs.IntVar(&o.port, "port", 80, "Port to listen on.")
-	fs.StringVar(&o.externalPluginsConfig, "external-plugins-config",
-		"/etc/external_plugins_config/external_plugins_config.yaml", "Path to external plugin config file.")
-	fs.BoolVar(&o.dryRun, "dry-run", true, "Dry run for testing. Uses API tokens but does not mutate.")
-	fs.StringVar(&o.webhookSecretFile, "hmac-secret-file",
-		"/etc/webhook/hmac", "Path to the file containing the GitHub HMAC secret.")
-
-	for _, group := range []flagutil.OptionGroup{&o.github} {
-		group.AddFlags(fs)
-	}
-	_ = fs.Parse(os.Args[1:])
-	return o
+	ol ownersclient.OwnersLoader
+	gc github.Client
 }
 
 func main() {
-	o := gatherOptions()
-	if err := o.validate(); err != nil {
+	o := tiexternalplugins.ServerOptions{}
+	o.ParseFromFlags()
+	if err := o.Validate(); err != nil {
 		logrus.Fatalf("Invalid options: %v", err)
 	}
 
-	log := logrus.StandardLogger().WithField("plugin", blunderbuss.PluginName)
-
-	epa := &tiexternalplugins.ConfigAgent{}
-	if err := epa.Start(o.externalPluginsConfig, false); err != nil {
-		log.WithError(err).Fatalf("Error loading external plugin config from %q.", o.externalPluginsConfig)
-	}
-
 	secretAgent := &secret.Agent{}
-	if err := secretAgent.Start([]string{o.github.TokenPath, o.webhookSecretFile}); err != nil {
+	if err := secretAgent.Start([]string{o.Github.TokenPath, o.WebhookSecretFile}); err != nil {
 		logrus.WithError(err).Fatal("Error starting secrets agent.")
 	}
 
-	githubClient, err := o.github.GitHubClient(secretAgent, o.dryRun)
+	githubClient, err := o.Github.GitHubClient(secretAgent, o.DryRun)
 	if err != nil {
 		logrus.WithError(err).Fatal("Error getting GitHub client.")
 	}
@@ -95,83 +46,20 @@ func main() {
 	client := &http.Client{Transport: tr}
 	ol := &ownersclient.OwnersClient{Client: client}
 
-	server := &server{
-		tokenGenerator: secretAgent.GetTokenGenerator(o.webhookSecretFile),
-		gc:             githubClient,
-		ol:             ol,
-		configAgent:    epa,
-		log:            log,
+	s := svr{
+		BaseServer: tiexternalplugins.NewBaseServer(blunderbuss.PluginName, &o, blunderbuss.HelpProvider),
+		gc:         githubClient,
+		ol:         ol,
 	}
 
-	health := pjutil.NewHealth()
-	health.ServeReady()
-
-	mux := http.NewServeMux()
-	mux.Handle("/", server)
-
-	helpProvider := blunderbuss.HelpProvider(epa)
-	externalplugins.ServeExternalPluginHelp(mux, log, helpProvider)
-	httpServer := &http.Server{Addr: ":" + strconv.Itoa(o.port), Handler: mux}
-
-	defer interrupts.WaitForGracefulShutdown()
-	interrupts.ListenAndServe(httpServer, 5*time.Second)
-}
-
-// server implements http.Handler. It validates incoming GitHub webhooks and
-// then dispatches them to the appropriate plugins.
-type server struct {
-	tokenGenerator func() []byte
-	gc             github.Client
-
-	ol          ownersclient.OwnersLoader
-	configAgent *tiexternalplugins.ConfigAgent
-	log         *logrus.Entry
-}
-
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	eventType, eventGUID, payload, ok, _ := github.ValidateWebhook(w, r, s.tokenGenerator)
-	if !ok {
-		return
-	}
-
-	if err := s.handleEvent(eventType, eventGUID, payload); err != nil {
-		logrus.WithError(err).Error("Error parsing event.")
-	}
-}
-
-// handleEvent distributed events and handles them.
-func (s *server) handleEvent(eventType, eventGUID string, payload []byte) error {
-	l := s.log.WithFields(
-		logrus.Fields{
-			"event-type":     eventType,
-			github.EventGUID: eventGUID,
+	s.SetHandlers(&tiexternalplugins.EventHandlers{
+		IssueComment: func(l *logrus.Entry, ic *github.IssueCommentEvent) error {
+			return blunderbuss.HandleIssueCommentEvent(s.gc, ic, s.GetExternalPluginConfig(), ol, l)
 		},
-	)
-	// Get external plugins config.
-	config := s.configAgent.Config()
-	switch eventType {
-	case tiexternalplugins.IssueCommentEvent:
-		var ice github.IssueCommentEvent
-		if err := json.Unmarshal(payload, &ice); err != nil {
-			return err
-		}
-		go func() {
-			if err := blunderbuss.HandleIssueCommentEvent(s.gc, &ice, config, s.ol, l); err != nil {
-				l.WithField("event-type", eventType).WithError(err).Info("Error handling event.")
-			}
-		}()
-	case tiexternalplugins.PullRequestEvent:
-		var pe github.PullRequestEvent
-		if err := json.Unmarshal(payload, &pe); err != nil {
-			return err
-		}
-		go func() {
-			if err := blunderbuss.HandlePullRequestEvent(s.gc, &pe, config, s.ol, l); err != nil {
-				l.WithField("event-type", eventType).WithError(err).Info("Error handling event.")
-			}
-		}()
-	default:
-		s.log.Debugf("received an event of type %q but didn't ask for it", eventType)
-	}
-	return nil
+		PullRequest: func(l *logrus.Entry, pr *github.PullRequestEvent) error {
+			return blunderbuss.HandlePullRequestEvent(s.gc, pr, s.GetExternalPluginConfig(), ol, l)
+		},
+	})
+
+	s.Run()
 }
